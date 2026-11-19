@@ -1,0 +1,11 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "portainer",
+      "description": "Portainer CE 管理 Docker Swarm 服务：栈部署与更新、服务扩缩容、整栈启停、任务排障、节点/容器/网络/卷/镜像查询",
+      "skills": ["portainer-manager", "portainer-manager-en"]
+    }
+  ]
+}
