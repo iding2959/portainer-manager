@@ -155,6 +155,10 @@ python3 skills/portainer-manager/scripts/portainer.py raw GET /api/stacks/name/n
 12. **`PullImage` 已废弃（2.36）**：用 `RepullImageAndRedeploy`
 13. **整栈启停是独立端点** `POST /stacks/{id}/start|stop`，不是改副本数
 14. **任务列表大部分是 shutdown 历史**（150 条里 107 条），排障要按 `DesiredState` 过滤
+15. **JWT 与 access token 是两种凭据**：JWT 走 `Authorization: Bearer`，UI 生成的 access token 才走 `X-API-Key`（CLI 的 `--token` 只支持前者）
+16. **CLI 建的栈在 UI 里是 "Limited control"**，改不了 API，只能用 `docker stack deploy` 重放 compose
+17. **旧建栈路径 `POST /api/stacks?type=swarm&method=string` 在 2.45.x 已 405**
+18. **「页面很卡」先测 `127.0.0.1:9000/api/system/status` 的 TTFB**，毫秒级说明瓶颈在反代/隧道
 
 ## 安全说明
 
@@ -175,7 +179,7 @@ portainer-manager/
 │   ├── references/
 │   │   ├── endpoints.md               # 鉴权 + 两条通道 + 三类 404 + 端点速查
 │   │   ├── schemas.md                 # 对象字段 / 枚举
-│   │   ├── pitfalls.md                # 实测坑全集（18 条）
+│   │   ├── pitfalls.md                # 实测坑全集（35 条）
 │   │   └── curl.md                    # 手写 curl/jq 片段
 │   └── scripts/
 │       ├── portainer.py               # CLI 入口（仅标准库）

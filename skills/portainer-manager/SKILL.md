@@ -1,6 +1,6 @@
 ---
 name: portainer-manager
-description: "Portainer CE 管理 Docker Swarm 服务的运维指南：查询栈/服务/任务/节点/容器/网络/卷/镜像，改栈重新部署、扩缩容、整栈启停、服务日志排障，以及 Portainer 自身端点/用户/团队/仓库管理。当用户提到 Portainer、portainer 管理、Docker Swarm 服务、栈 stack 部署、服务扩缩容、任务 failed 排障、Swarm 节点、容器日志、portainer API 时加载。"
+description: "Portainer CE 管理 Docker Swarm 服务的运维指南：查询栈/服务/任务/节点/容器/网络/卷/镜像，改栈重新部署、扩缩容、整栈启停、服务日志排障，以及 Portainer 自身端点/用户/团队/仓库管理。当用户提到 Portainer、portainer 管理、Docker Swarm 服务、栈 stack 部署、服务扩缩容、任务 failed 排障、Swarm 节点、容器日志、portainer API 时加载。**同样重要：**即使完全没提 Portainer 或 Swarm，只要诉求落在「某个容器/服务为什么起不来或一直重启」「把服务扩到 N 个副本/缩容停机」「换某个服务的镜像版本」「服务日志在哪看」「集群里有哪些节点/哪些服务在跑」这类容器编排运维问题上，都应该加载本 skill——这类问题用 docker CLI 手搓容易踩 Swarm 特有的坑。"
 license: MIT
 metadata:
   author: iding2959
@@ -71,10 +71,23 @@ n8n  n8n   replicated  1/1        5678->5678  ghcr.io/deluxebear/n8n:2.36.9-chs 
 |---|---|
 | `references/endpoints.md` | 调用约定（鉴权/两条通道/三类 404）+ 栈与 docker 透传端点速查 |
 | `references/schemas.md` | 要确认字段名、枚举值（Stack.Type/Status、Task.State、Service.Mode…） |
-| `references/pitfalls.md` | **排障前必读**：18 条坑 + 实测证据（尤其前 3 条） |
+| `references/pitfalls.md` | **排障前必读**：35 条坑 + 实测证据（正文只留 27 条高频，尤其前 3 条） |
 | `references/curl.md` | 需要手写 curl 或脱离 CLI 调用时 |
 
-## 2. 配置
+## 2. 关键限制：改服务只能走栈
+
+**Docker 透传层只放行 GET 与 DELETE，`PUT`/`POST`/`PATCH` 全部 `404 page not found`**（实测）。
+
+所以「扩缩容 / 改镜像 / 改环境变量」**不能**直接 `PUT /docker/services/{id}`，只有三条路：
+
+1. **栈更新**（本 CLI 的 `stacks update` / `services scale`）——改 compose 重新部署整栈，可审计可回滚 ✅ 推荐
+2. SSH 到节点 `docker service update`——精确改单服务，不重排其他服务
+3. Portainer Web UI 的 Stack Editor
+
+**代价**：改单个服务会影响整个栈的部署（其余服务也会走一次更新流程）。
+需要只动一个服务时，用 SSH + `docker service update`。
+
+## 3. 配置
 
 | 方式 | 参数 | 说明 |
 |---|---|---|
@@ -101,7 +114,7 @@ n8n  n8n   replicated  1/1        5678->5678  ghcr.io/deluxebear/n8n:2.36.9-chs 
 
 会话 token 只存在进程内存里，不落盘；登录失败时 `/api/auth` 返回 **422**（不是 401）。
 
-## 3. 命令全表
+## 4. 命令全表
 
 ### 3.1 只读视图
 
@@ -150,19 +163,6 @@ python3 scripts/portainer.py services get n8n:n8n    # 栈:服务（跨栈重名
 ```
 
 简称命中多个服务时报错并列出全名。无栈服务（如 `sandbox-api`）只能用全名。
-
-## 4. 关键限制：改服务只能走栈
-
-**Docker 透传层只放行 GET 与 DELETE，`PUT`/`POST`/`PATCH` 全部 `404 page not found`**（实测）。
-
-所以「扩缩容 / 改镜像 / 改环境变量」**不能**直接 `PUT /docker/services/{id}`，只有三条路：
-
-1. **栈更新**（本 CLI 的 `stacks update` / `services scale`）——改 compose 重新部署整栈，可审计可回滚 ✅ 推荐
-2. SSH 到节点 `docker service update`——精确改单服务，不重排其他服务
-3. Portainer Web UI 的 Stack Editor
-
-**代价**：改单个服务会影响整个栈的部署（其余服务也会走一次更新流程）。
-需要只动一个服务时，用 SSH + `docker service update`。
 
 ## 5. 典型任务剧本
 
@@ -314,6 +314,11 @@ python3 scripts/portainer.py volumes list --dangling
 21. **整栈 `stop` 会移除服务定义；`start` 对 active 栈 409、对已停栈可能超时且只重建为 `0/0`**。日常停单服务用 `services scale -r 0`。
 22. **镜像拉不到时任务是 `rejected` 不是 `failed`**，且会在节点间反复重试；排障要按 `rejected` 一起看。
 23. **多节点上 `node2` 的 `Status.Addr` 可能是 `0.0.0.0`**，按地址识别节点会失效，用 Hostname。
+24. **JWT 与 access token 是两种凭据**：JWT 走 `Authorization: Bearer`，UI 生成的 access token 才走 `X-API-Key`。CLI 的 `--token` 只支持前者。
+25. **CLI 建的栈在 UI 里是 "Limited control"**，Update/Remove 灰掉，且同内容重建会 409——这类栈改不了 API，
+    要用 `docker stack deploy` 重放 compose。对 Portainer 自己承载的栈是无解的死结（删了没人发命令）。
+26. **旧建栈路径 `POST /api/stacks?type=swarm&method=string` 在 2.45.x 已 405**，只剩 `/api/stacks/create/swarm/{string,file,repository}`。
+27. **「页面很卡」先测 `127.0.0.1:9000/api/system/status` 的 TTFB**：毫秒级就说明问题在反代/隧道，不在 Portainer（公网隧道实测 0.75–1.9s）。
 
 ## 7. 端点速查
 

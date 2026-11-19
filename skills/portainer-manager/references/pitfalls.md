@@ -292,3 +292,87 @@ slot 1  desired=shutdown state=rejected    ← 拉失败的历史任务
 发布 `18080:80` 后，`http://192.168.48.62:18080` 与 `http://192.168.48.61:18080`
 都返回 200（ingress 路由把请求转给实际持有副本的节点）。
 缩容到 0 后无服务监听该端口，连接直接失败（curl exit 7）。
+
+---
+
+# 从 183 现场巡检验证的补充（来源：`ops/deploy/findings/portainer-iding-net.md`）
+
+> 这些结论来自 183 单节点 Swarm（Portainer CE 2.45.3）的长期运维记录，与本 skill 互补。
+> 只收录**技能此前未覆盖、且会真实影响操作**的条目。
+
+## 29. 【实测】JWT 与 access token 是两种凭据，只有后者能用 `X-API-KEY`
+
+容易混淆，必须分清：
+
+| 凭据 | 获取方式 | 发送头 |
+|---|---|---|
+| **JWT** | `POST /api/auth {Username,Password}` | `Authorization: Bearer <jwt>` |
+| **Access token** | Portainer UI → My account → Access tokens | `X-API-Key: <token>` |
+
+把 JWT 放 `X-API-KEY` → `401 Invalid JWT token`（本 skill 第 2 条）。反过来 access token 如果当 Bearer 发也不会认。
+**CLI 目前只支持 JWT 通道**（`--token` 走 Bearer）；要长期自动化，推荐在 UI 生成 access token 后
+用 `raw` 或 curl 配 `X-API-Key`，别复用到 CLI 的 `--token`。
+
+## 30. 【实测】旧建栈路径在 2.45.x 已 405
+
+```
+POST /api/stacks?type=swarm&method=string&endpointId=1     → 405（2.45.3）
+POST /api/stacks/create/swarm/string?endpointId=1          → 200 ✅
+```
+
+2.45.x 只剩 `/api/stacks/create/{swarm,standalone}/{string,file,repository}` 这一套。
+老教程/老脚本里的 `?type=&method=` 写法会直接 405。
+
+## 31. 【实测】CLI 建的栈在 UI 里是 "Limited control"，且无法转正
+
+- 表现：栈详情显示 `This stack was created outside of Portainer. Control over this stack is limited.`，
+  Update / Remove 按钮灰掉。
+- **不能用 API 转正**：用同内容再 `POST /api/stacks/create/swarm/string` 会 409
+  `A stack with the normalized name 'xxx' already exists`；查 bbolt 库确认 DB 里根本没有该栈记录，
+  409 来自「Swarm 里已存在同名栈」。
+- 想变成 Total control 只能重建：`docker stack rm <name>` 后由 Portainer 重新创建。
+- **对 Portainer 自己的栈是个死结**（删了没人发命令）：保持 CLI 管理即可，
+  或把 Portainer 搬出 Swarm（宿主机 `docker run` + systemd），让它不再管理自己。
+
+对 CLI 用户的含义：`stacks update` 走的是 Portainer API，**对 CLI 建的栈可能被拒**（Limited control）；
+这类栈要改，用 `docker stack deploy` 重放 compose，别指望 API。
+
+## 32. 【实测】`PublicURL` 为空会让端口链接变成 `http://:6185`
+
+Stacks 页面里端口链接点不动/跳空白，根因是环境没填 Public IP：
+
+```bash
+curl -s $P/api/endpoints/1 | jq -r '.PublicURL'      # 空串
+# 修复（最小 body 即可）
+curl -X PUT $P/api/endpoints/1 -H "Authorization: Bearer $JWT" \
+  -H 'Content-Type: application/json' -d '{"PublicURL":"192.168.0.183"}'
+```
+
+修复后 href 从 `http://:6185` 变成 `http://192.168.0.183:6185`。
+**只影响链接拼装，不影响服务本身**；数据库端口点开必然是空白（那不是网页）。
+
+## 33. 【实测】`GET /api/system/status` 是免鉴权的，适合做 healthcheck
+
+Portainer 自带这个端点不需要 token，返回 `{"Version":"2.45.3",...}`。
+`portainer-ce` 与 `agent` 镜像都是 distroless（没有 sh/curl/wget/nc），
+所以容器内做 healthcheck 要**从宿主挂一个静态 musl busybox**：
+
+```yaml
+volumes: [/home/iding/sh/bin/busybox:/busybox:ro]
+healthcheck:
+  test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/api/system/status"]
+```
+
+注意必须是 **musl 版**（`busybox:1.37-musl`）——默认 `busybox:1.37` 是 glibc 动态链接，
+进 distroless 容器报缺 `ld-linux`。
+
+## 34. 【实测】「页面偶尔很卡」通常是入口链路，不是 Portainer
+
+定位顺序（同一时刻实测 183）：后端接口全在 1 ms 级，最重的 `containers/json?all=1` 也才 75 ms，
+`images/json` 103 ms，LAN 下载 7 MB 的 `main.js` 11 ms。而走 Cloudflare 隧道的公网入口
+TTFB 稳定在 **0.75–1.9 s**，且有 90 分钟 11 次的 QUIC 断线。
+
+判据：**先测 `127.0.0.1:9000/api/system/status` 的 TTFB**。
+如果它是毫秒级，问题就在反代/隧道/客户端，不在 Portainer 本身。
+次要噪音：`SnapshotInterval=5m` 抓快照时接口会到百毫秒级；每 5 分钟一条 `403` 是版本检查在打
+`api.github.com` / `downloads.portainer.io`，无影响。

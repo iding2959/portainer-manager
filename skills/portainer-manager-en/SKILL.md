@@ -1,6 +1,6 @@
 ---
 name: portainer-manager-en
-description: "Portainer CE management skill for Docker Swarm services: inspect stacks/services/tasks/nodes/containers/networks/volumes/images, update stacks via redeploy, scale replicas, start/stop whole stacks, troubleshoot failed tasks via logs, and manage Portainer endpoints/users/teams/registries. Load when the user mentions Portainer, Docker Swarm services, stack deployment, service scaling, failed task troubleshooting, Swarm nodes, container logs, or the Portainer API."
+description: "Portainer CE management skill for Docker Swarm services: inspect stacks/services/tasks/nodes/containers/networks/volumes/images, update stacks via redeploy, scale replicas, start/stop whole stacks, troubleshoot failed tasks via logs, and manage Portainer endpoints/users/teams/registries. Load when the user mentions Portainer, Docker Swarm services, stack deployment, service scaling, failed task troubleshooting, Swarm nodes, container logs, or the Portainer API. **Also load it even when Portainer is never mentioned:** if the request is about why a container or service will not start or keeps restarting, scaling a service up or down, changing a service's image tag, where to find service logs, or which nodes/services exist — that is container-orchestration operations, and doing it with raw docker CLI tends to hit Swarm-specific traps this skill already documents."
 license: MIT
 metadata:
   author: iding2959
@@ -58,7 +58,7 @@ python3 scripts/portainer.py tasks list --failed-only
 |---|---|
 | `../portainer-manager/references/endpoints.md` | Call conventions (auth, two channels, three 404 shapes) + endpoint lookup |
 | `../portainer-manager/references/schemas.md` | Field names and enums (Stack.Type/Status, Task.State, Service.Mode…) |
-| `../portainer-manager/references/pitfalls.md` | **Read before troubleshooting**: 18 pitfalls with evidence |
+| `../portainer-manager/references/pitfalls.md` | **Read before troubleshooting**: 35 pitfalls with evidence (27 high-frequency ones in the body) |
 | `../portainer-manager/references/curl.md` | Writing raw curl instead of using the CLI |
 
 > Both skills are installed together by default; the CLI and references live under
@@ -268,6 +268,10 @@ measure real usage over SSH with `du`.
 21. **`stacks stop` removes the service definitions; `start` returns 409 when active and may time out when stopped, rebuilding at `0/0`.** Use `services scale -r 0` to stop one service.
 22. **An unpullable image yields tasks in `rejected`, not `failed`**, retried across nodes. Include `rejected` in triage.
 23. **On multi-node clusters `Status.Addr` can be `0.0.0.0`**; identify nodes by Hostname, not address.
+24. **JWT and access tokens are different credentials**: JWT uses `Authorization: Bearer`; a UI-generated access token uses `X-API-Key`. The CLI's `--token` only supports the former.
+25. **A stack created by CLI shows as "Limited control" in the UI** (Update/Remove greyed out) and re-creating it returns 409. Manage those with `docker stack deploy`, not the API.
+26. **The legacy create path `POST /api/stacks?type=swarm&method=string` returns 405 on 2.45.x**; only `/api/stacks/create/swarm/{string,file,repository}` remains.
+27. **"The UI is slow" — measure `127.0.0.1:9000/api/system/status` TTFB first.** Milliseconds there means the problem is the reverse proxy or tunnel, not Portainer (public tunnel measured 0.75–1.9s).
 
 ## 7. Endpoint quick reference
 
