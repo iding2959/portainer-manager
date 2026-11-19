@@ -186,3 +186,109 @@ curl ... /docker/tasks | jq -r '.[]|select(.DesiredState!="shutdown")|"\(.Status
 
 本环境所有栈 `GitConfig` 为 null；`X-API-KEY` 鉴权仅有 spec 声明、未跑通。
 CLI 的 git 相关能力（`StackUpdateGit`/`StackGitRedeploy`）未实现，需要时用 `raw`。
+---
+
+# 多节点集群 + Portainer 2.45.1 补充实测（2026-11-19）
+
+> 第二套环境：`http://192.168.48.62:9000`，Portainer **CE 2.45.1**、Docker **29.1.3**（API 1.52），
+> **3 节点 Swarm**（全部 manager：`master` 48.61 / `node1` 48.62 / `node2`）。
+> 这批结论补上了首版文档里标注为「未验证」的多节点部分。
+
+## 19. 【实测】2.45.1 与 2.39.4 的核心 API 一致，CLI 同一套直接可用
+
+`health` / `stacks` / `services` / `nodes` / `tasks` / `containers` / `networks` / `volumes` /
+`images` / `endpoints` / `users` / `registries` / `raw` 全部 26 项命令在两版上回归通过。
+`StackStart` / `StackStop` / `RepullImageAndRedeploy` 在 2.45.1 同样存在。
+
+## 20. 【实测】创建栈必须带 `SwarmID`（两版都要求）
+
+```json
+POST /api/stacks/create/swarm/string?endpointId=1
+{"Name":"...","StackFileContent":"...","SwarmID":"4marnwyvnrnj8nc3uvothnezi"}
+```
+
+漏传 → `400 {"message":"Invalid request payload","details":"Invalid Swarm ID"}`。
+官方 spec 的 `stacks.swarmStackFromFileContentPayload.required` 里就有 `SwarmID`。
+
+**取法**：Endpoints 快照的 `DockerSnapshotRaw.Swarm` 是 null，只能实时打
+`GET /api/endpoints/{id}/docker/swarm` 拿 `.ID`。CLI 已自动取（`--swarm-id` 可覆盖）。
+
+## 21. 【实测 · 高风险】PUT 返回 200 不代表栈文件真的改了 → 必须回读校验
+
+在 2.45.1 上遇到过：`PUT /api/stacks/{id}` 返回 `200`，但随后 `GET /stacks/{id}/file`
+拿到的还是旧内容。**而 `scale` 是以栈文件为准重新部署的**，于是「改了镜像 → 扩容 →
+镜像被悄悄改回去」。现场就要多排查一轮。
+
+**CLI 处置**：`stacks update` 与 `services scale` 写完都回读栈文件，内容不一致直接报错，
+不再静默成功。
+
+## 22. 【实测】`--set-image` 只改栈文件，不会同步已偏离的服务
+
+`stacks update --set-image` 改的是 compose 文本并触发重新部署。如果实际运行的服务镜像
+早已偏离栈文件（比如手工 `docker service update` 过），一次 `--set-image` 只会把栈文件
+推到目标值。改完务必核对：
+
+```bash
+python3 portainer.py stacks file <stack> | grep image:
+python3 portainer.py services list --stack <stack>
+```
+
+## 23. 【实测】跨节点容器日志取不到（多节点核心限制）
+
+`GET /api/endpoints/{id}/docker/containers/{cid}/logs` **只能访问 agent 所在节点**的容器。
+任务被调度到别的节点时，容器 id 在列表里查得到，取日志却返回：
+
+```
+404 {"message":"No such container: <id>"}
+```
+
+同理 `containers/json` 也只列 agent 本机的容器（3 节点集群里 endpoint 1 只看到 22 个，
+而集群总容器 63 个）。
+
+**处置**：SSH 到该容器所在节点执行 `docker logs <id>`；或直连该节点的 agent。
+CLI 的 `services logs` 已把这条限制写进报错提示，并给出目标节点名。
+
+## 24. 【实测】`StackStop` 会移除服务定义，`StackStart` 只重建「0 副本」态
+
+| 操作 | 结果 |
+|---|---|
+| `POST /stacks/{id}/stop` | 服务被移除（`services list --stack` 变空） |
+| `POST /stacks/{id}/start` 对 active 栈 | `409 {"message":"Unable to start stack","details":"Stack is already active"}` |
+| `POST /stacks/{id}/start` 对已停栈 | 实测**超时**（ingress 拉服务期间不回包），但服务定义会重建为 `0/0` |
+| `services scale -r N` | 稳定可用，是恢复副本的**推荐**方式 |
+
+**结论**：整栈启停用于「整栈下线/上线」，日常停某个服务用 `services scale -r 0`；
+`StackStart` 之后若副本是 0，仍需一次 `services scale` 才能拉起。
+
+## 25. 【实测】镜像拉不到时任务是 `rejected` 不是 `failed`，且跨节点反复重试
+
+把镜像改成不存在的 tag 后：
+
+```
+slot 1  desired=running  state=preparing   ← 仍在拉
+slot 1  desired=shutdown state=rejected    ← 拉失败的历史任务
+```
+
+- 失败状态是 **`rejected`**（不是 `failed`），`--failed-only` 必须把它算进去
+- 调度器会在**节点间反复重试**（master → node2 → …），所以 tasks 列表里同一 slot 有多个任务
+- 服务一直保持 `0/N`，不会自动放弃
+
+## 26. 【实测】多节点上 `node2` 的 `Status.Addr` 是 `0.0.0.0`
+
+3 节点里 `node2` 的 `Status.Addr` 显示 `0.0.0.0`，另两个是真实 IP。
+按地址做节点识别会失效，用 `Description.Hostname` 或节点 ID。
+（`ManagerStatus.Reachability` 三个都是 `reachable`，没有区分出 leader —— 该字段在此环境不可靠。）
+
+## 27. 【实测】扩缩容默认跨节点均匀分布
+
+`replicas: 3` 在 3 节点集群上落到 3 个不同节点（spread 策略默认生效）：
+
+```
+槽位1 → master   槽位2 → node1   槽位3 → node2
+```
+
+## 28. 【实测】ingress 端口在任意节点都可访问
+
+发布 `18080:80` 后，`http://192.168.48.62:18080` 与 `http://192.168.48.61:18080`
+都返回 200（ingress 路由把请求转给实际持有副本的节点）。
+缩容到 0 后无服务监听该端口，连接直接失败（curl exit 7）。

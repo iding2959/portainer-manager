@@ -5,6 +5,8 @@ Portainer CE 管理 Docker Swarm 服务的 Agent Skill（**CE 2.39.4 实测沉�
 
 配套一个**仅用 Python 标准库**的 CLI：`skills/portainer-manager/scripts/portainer.py`，零安装、零依赖，Agent 直接 `python3` 调用。
 
+[![skills.sh](https://skills.sh/b/iding2959/portainer-manager)](https://www.skills.sh/iding2959/portainer-manager)
+
 ## 为什么需要它
 
 Portainer 的 Web UI 够用，但 Agent 需要的是**可脚本化、可断言、可回读**的操作面：
@@ -185,10 +187,11 @@ portainer-manager/
 
 ## 环境与验证
 
-- **基线**：Portainer **CE 2.39.4**、Docker **29.6.1**（API 1.55 / min 1.40）、Ubuntu 24.04.2 LTS、48 核 / 135GB
-- **拓扑**：单节点 Swarm，manager `email-node`（192.168.0.131），Swarm ID `r0e14x2c…`
-- **规模**：32 服务 / 27 栈记录 / 169 容器（55 运行）/ 545 镜像 / 90 卷 / 13 网络
-- **未验证**：多节点 Swarm、Kubernetes 端点、Edge、Git 栈、API key（`X-API-KEY`）鉴权 —— 文档中均已标注
+- **环境 A**：Portainer **CE 2.39.4**、Docker **29.6.1**（API 1.55）、Ubuntu 24.04.2 LTS、单节点 Swarm `email-node`；32 服务 / 27 栈 / 169 容器 / 545 镜像（`192.168.0.57`）
+- **环境 B**：Portainer **CE 2.45.1**、Docker **29.1.3**（API 1.52）、**3 节点 Swarm**（master/node1/node2 全 manager）、63 容器（`192.168.48.62`）
+- **跨版本**：同一套 CLI 在 2.39.4 / 2.45.1 上 26 项命令全部回归通过
+- **已演练**：stack 创建 → 扩副本（跨节点 spread）→ 缩容 → scale 0 停机 → 整栈 stop/start → 删除清理
+- **未验证**：Kubernetes 端点、Edge、Git 栈、API key（`X-API-KEY`）鉴权 —— 文档中均已标注
 
 ## License
 

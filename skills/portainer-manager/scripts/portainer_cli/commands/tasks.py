@@ -9,7 +9,16 @@ from ..output import dump_json, print_table, short_id
 from ..resolve import all_services, resolve_service
 
 
-FAILED_STATES = ("failed", "rejected", "orphaned", "remove")
+# 失败类状态。**实测：镜像不存在导致的拉取失败，任务表现为 `rejected` 而不是 `failed`**
+# （2026-11-19 在 2.45.1 三节点集群复现），所以 rejected 必须算进来，否则 --failed-only 会漏报。
+FAILED_STATES = (
+    "failed",
+    "rejected",
+    "orphaned",
+    "remove",
+    "start_failed",
+    "running_but_unhealthy",
+)
 
 
 def _service_names(cfg: Config) -> Dict[str, str]:
@@ -47,6 +56,8 @@ def list_tasks(cfg: Config, args: Any) -> int:
             task for task in tasks
             if ((task.get("Status") or {}).get("State") or "") == args.state
         ]
+    # 默认隐藏 shutdown 历史（150 条里 107 条都是历史，真正的问题会被淹没）。
+    # --all 打开历史；--failed-only 与 --all 互相独立：一个管「时间范围」，一个管「状态」。
     if args.failed_only:
         tasks = [
             task for task in tasks

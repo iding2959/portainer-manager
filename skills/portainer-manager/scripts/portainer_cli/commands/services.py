@@ -9,7 +9,7 @@
 
 from typing import Any, Dict, List, Tuple
 
-from .. import EXIT_OK, UsageError, add_sub
+from .. import ApiError, EXIT_OK, UsageError, add_sub
 from ..config import Config
 from ..http import as_list, docker_get, docker_path, get_json, request, require_ok
 from ..output import (
@@ -169,6 +169,11 @@ def scale_service(cfg: Config, args: Any) -> int:
         return EXIT_OK
 
     require_ok(request(cfg, "PUT", path, data=body))
+
+    # 同样回读校验：scale 以栈文件为准重新部署，写入没生效会静默沿用旧值（含旧镜像）。
+    from .stacks import _verify_stack_file
+
+    _verify_stack_file(cfg, stack["Id"], new_content, f"scale {short_name} -> {target}")
     if args.json:
         dump_json({"stack": stack["Id"], "service": short_name, "replicas": target})
     else:
@@ -282,13 +287,16 @@ def _service_block_indent(content: str) -> int:
 
 
 def logs_service(cfg: Config, args: Any) -> int:
-    """服务日志：Portainer 代理不提供 logs 端点，改为按服务的任务找容器再取日志。"""
+    """服务日志：Portainer 代理不提供 logs 端点，改为按服务的任务找容器再取日志。
+
+    ⚠️ 多节点限制（2026-11-19 在 3 节点集群实测）：`/api/endpoints/{id}/docker/containers/...`
+    只能访问 **agent 所在节点** 上的容器。任务调度到别的节点时，容器 id 在本地列表里查得到，
+    但取日志会得到 `404 No such container`。此时必须到该节点上去取（SSH 或直连该节点 agent）。
+    """
     service = resolve_service(cfg, args.service)
     service_id = service.get("ID") or ""
     containers_path = f"/api/endpoints/{cfg.endpoint_id}/docker/containers/json"
-    containers = as_list(
-        get_json(cfg, containers_path + "?all=1"), containers_path
-    )
+    containers = as_list(get_json(cfg, containers_path + "?all=1"), containers_path)
     matched = [
         item
         for item in containers
@@ -297,20 +305,49 @@ def logs_service(cfg: Config, args: Any) -> int:
     if not matched:
         raise UsageError(f"服务 '{service['Spec']['Name']}' 当前没有容器（副本可能为 0）")
     matched.sort(key=lambda item: item.get("Created") or 0, reverse=True)
-    container_id = matched[0].get("Id")
-    logs = require_ok(
-        request(
-            cfg,
-            "GET",
-            docker_path(
+    container = matched[0]
+    container_id = container.get("Id")
+
+    node_name = _node_hostname(container, cfg)
+    try:
+        logs = require_ok(
+            request(
                 cfg,
-                f"containers/{container_id}/logs?stdout=1&stderr=1&tail={args.tail}"
-                "&timestamps=false",
-            ),
-        )
-    ).text
+                "GET",
+                docker_path(
+                    cfg,
+                    f"containers/{container_id}/logs?stdout=1&stderr=1&tail={args.tail}"
+                    "&timestamps=false",
+                ),
+            )
+        ).text
+    except ApiError as exc:
+        if "No such container" in str(exc):
+            raise UsageError(
+                f"容器 {str(container_id)[:12]} 运行在节点 '{node_name}'，"
+                f"而当前 endpoint（#{cfg.endpoint_id}）的 agent 访问不到它。\n"
+                "Portainer 的 containers/* 子端点只覆盖 agent 所在节点；多节点集群上要取日志，"
+                f"请 SSH 到 '{node_name}' 执行 `docker logs {str(container_id)[:12]}`，"
+                "或改为直连该节点的 agent。"
+            ) from exc
+        raise
     print(logs, end="" if logs.endswith("\n") else "\n")
     return EXIT_OK
+
+
+def _node_hostname(container: Dict[str, Any], cfg: Config) -> str:
+    """把容器标签里的 node id 换成可读主机名，报错时才有用。"""
+    node_id = (container.get("Labels") or {}).get("com.docker.swarm.node.id") or ""
+    if not node_id:
+        return "(未知节点)"
+    try:
+        nodes = as_list(docker_get(cfg, "nodes"), f"/api/endpoints/{cfg.endpoint_id}/docker/nodes")
+    except ApiError:
+        return node_id[:12]
+    for node in nodes:
+        if node.get("ID") == node_id:
+            return (node.get("Description") or {}).get("Hostname") or node_id[:12]
+    return node_id[:12]
 
 
 def register(subparsers: Any, common: Any) -> None:

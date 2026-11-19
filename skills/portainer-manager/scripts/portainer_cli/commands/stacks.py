@@ -9,7 +9,7 @@
 import json
 from typing import Any, List
 
-from .. import EXIT_OK, UsageError, add_sub
+from .. import ApiError, EXIT_OK, UsageError, add_sub
 from ..config import Config
 from ..http import get_json, request, require_ok
 from ..output import dump_json, print_table
@@ -145,11 +145,40 @@ def update_stack(cfg: Config, args: Any) -> int:
 
     response = require_ok(request(cfg, "PUT", path, data=body))
     payload = response.json()
+
+    # PUT 返回 200 不等于改动生效：实测 2.45.1 上曾出现「响应 200、栈文件却没变」，
+    # 而后续 scale 会以栈文件为准重新部署，于是把镜像我改回去了。
+    # 这里回读栈文件比对，不一致就明确失败，避免静默漂移。
+    _verify_stack_file(cfg, stack["Id"], content, source)
+
     if args.json:
         dump_json(payload)
     else:
         print(f"栈 '{stack['Name']}' 已更新（{source}）")
     return EXIT_OK
+
+
+def _verify_stack_file(cfg: Config, stack_id: Any, expected: str, source: str) -> None:
+    """回读栈文件确认改动真的落盘（PUT 200 不代表生效）。"""
+    actual = (get_json(cfg, f"/api/stacks/{stack_id}/file") or {}).get("StackFileContent") or ""
+    if _normalize(actual) == _normalize(expected):
+        return
+    raise ApiError(
+        f"栈文件写入未生效：PUT 返回成功，但回读内容与提交的不一致（来源 {source}）。\n"
+        "这会导致后续 scale/update 以旧栈文件覆盖本次改动——请重试，或用 "
+        "`stacks file` 核对后手工修正。\n"
+        f"回读内容特征：{_stack_image_lines(actual)}"
+    )
+
+
+def _normalize(text: str) -> str:
+    """忽略行尾空白与末尾换行造成的假差异。"""
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+
+
+def _stack_image_lines(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip().startswith("image:")]
+    return "、".join(lines) or "（无 image 行）"
 
 
 def _service_block_indent(content: str) -> int:
@@ -251,18 +280,25 @@ def stop_stack(cfg: Config, args: Any) -> int:
 
 
 def create_stack(cfg: Config, args: Any) -> int:
-    """从本地 compose 文件创建 Swarm 栈（POST /stacks/create/swarm/string）。"""
+    """从本地 compose 文件创建 Swarm 栈（POST /stacks/create/swarm/string）。
+
+    `SwarmID` 在官方 spec 里是**必填**（2.39.4 与 2.45.1 都是），不传会得到
+    `400 Invalid request payload / Invalid Swarm ID`。它无法从 endpoint 元数据可靠取得
+    （快照里的 DockerSnapshotRaw.Swarm 是 null），所以直接查 `/docker/swarm`。
+    """
     content = _read_file(args.file, "栈文件")
+    swarm_id = args.swarm_id or _current_swarm_id(cfg)
     body = {
         "Name": args.name,
         "StackFileContent": content,
+        "SwarmID": swarm_id,
         "Env": [{"name": item.split("=", 1)[0], "value": item.split("=", 1)[1]}
                 for item in (args.env or []) if "=" in item],
         "FromAppTemplate": False,
     }
     path = f"/api/stacks/create/swarm/string?endpointId={cfg.endpoint_id}"
     if args.dry_run:
-        print(f"将 POST {path}")
+        print(f"将 POST {path}（SwarmID={swarm_id}）")
         dump_json({**body, "StackFileContent": _tail(content, 20)})
         return EXIT_OK
     if not args.yes:
@@ -275,6 +311,23 @@ def create_stack(cfg: Config, args: Any) -> int:
     else:
         print(f"栈 '{args.name}' 已创建（id={payload.get('Id')}）")
     return EXIT_OK
+
+
+def _current_swarm_id(cfg: Config) -> str:
+    """当前 endpoint 所属 Swarm 的 ID。
+
+    Endpoint 快照里的 DockerSnapshotRaw.Swarm 实测为 null，只能实时打 /docker/swarm。
+    """
+    from ..http import docker_get
+
+    swarm = docker_get(cfg, "swarm") or {}
+    swarm_id = swarm.get("ID")
+    if not swarm_id:
+        raise UsageError(
+            "取不到当前 Swarm ID：该 endpoint 可能不是 Swarm 环境。"
+            "用 --swarm-id 显式指定，或先确认 `health` 里的 Swarm 状态"
+        )
+    return swarm_id
 
 
 def register(subparsers: Any, common: Any) -> None:
@@ -312,6 +365,10 @@ def register(subparsers: Any, common: Any) -> None:
     creator.add_argument("--name", required=True, help="栈名")
     creator.add_argument("--file", required=True, metavar="PATH", help="compose 文件")
     creator.add_argument("--env", action="append", metavar="K=V", help="栈环境变量，可重复")
+    creator.add_argument(
+        "--swarm-id", metavar="ID",
+        help="Swarm 集群 id（官方 spec 必填）；不传自动从 /docker/swarm 取当前集群",
+    )
     creator.add_argument("--dry-run", action="store_true", help="只打印将提交的请求体")
     creator.add_argument("--yes", action="store_true", help="确认创建（危险操作必需）")
     creator.set_defaults(func=create_stack)

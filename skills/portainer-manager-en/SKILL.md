@@ -19,8 +19,9 @@ Scope: how Portainer and Swarm are operated. Not the internals of the workloads 
 Verified against: **Portainer CE 2.39.4** (`http://192.168.0.57:9000`), **Docker 29.6.1** (API 1.55),
 **single-node Swarm** (host `email-node`; 32 services / 27 stack records / 169 containers / 545 images / 90 volumes).
 
-> ⚠️ **This environment has only one manager node.** Multi-node conclusions (task rescheduling,
-> global service distribution, multi-manager election) are marked `[unverified]` throughout.
+> Verified on two environments: **2.39.4 single-node** (`192.168.0.57`) and **2.45.1 three-node**
+> (`192.168.48.62`; all managers: master/node1/node2). The same CLI passes regression on both.
+> Multi-node findings: `../portainer-manager/references/pitfalls.md` items 19–28.
 
 The CLI ships inside this skill: entry point `scripts/portainer.py`, implementation in
 `scripts/portainer_cli/` (Python 3.9+, **standard library only**, zero install).
@@ -261,7 +262,12 @@ measure real usage over SSH with `du`.
 15. **Most tasks are shutdown history** (107 of 150 here); filter on `DesiredState != shutdown`.
 16. **`RepoTags` can be empty**; service images often carry `@sha256:` suffixes.
 17. **`volumes` returns `{Volumes:[...]}`**, unlike the other list endpoints.
-18. **Multi-node behaviour is unverified here** (single manager only).
+18. **Stack creation requires `SwarmID`** on both versions; missing → `400 Invalid Swarm ID`. The CLI reads it from `/docker/swarm`.
+19. **A 200 from `PUT /stacks/{id}` does not prove the stack file changed.** On 2.45.1 the response was 200 while a read-back returned the old content — and `scale` redeploys from the stack file, silently reverting the image. The CLI read-back-verifies every write.
+20. **Container logs cannot cross nodes**: `containers/{id}/logs` only reaches containers on the agent's own node; otherwise `404 No such container`. Container lists are node-local too. SSH to the target node for `docker logs`.
+21. **`stacks stop` removes the service definitions; `start` returns 409 when active and may time out when stopped, rebuilding at `0/0`.** Use `services scale -r 0` to stop one service.
+22. **An unpullable image yields tasks in `rejected`, not `failed`**, retried across nodes. Include `rejected` in triage.
+23. **On multi-node clusters `Status.Addr` can be `0.0.0.0`**; identify nodes by Hostname, not address.
 
 ## 7. Endpoint quick reference
 

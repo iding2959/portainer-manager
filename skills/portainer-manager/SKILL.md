@@ -19,8 +19,9 @@ metadata:
 已验证环境：**Portainer CE 2.39.4**（`http://192.168.0.57:9000`）、**Docker 29.6.1**（API 1.55）、
 **单节点 Swarm**（宿主 `email-node`，32 服务 / 27 栈记录 / 169 容器 / 545 镜像 / 90 卷）。
 
-> ⚠️ **本环境只有 1 个 manager 节点**。多节点相关结论（节点漂移、global 分布、多 manager 选举）
-> 未经实测，文档里明确标注为 `[未验证]`。
+> 已在两套环境验证：**2.39.4 单节点**（`192.168.0.57`）+ **2.45.1 三节点**（`192.168.48.62`，
+> 全部 manager：master/node1/node2，Docker 29.1.3）。同一套 CLI 在两版上均回归通过。
+> 多节点结论见 `references/pitfalls.md` 第 19–28 条。
 
 CLI 在本 skill 目录里：入口 `scripts/portainer.py`，实现在 `scripts/portainer_cli/` 包
 （Python 3.9+，**仅标准库**，零安装）。下文命令都以 **skill 目录为工作目录**。
@@ -307,7 +308,12 @@ python3 scripts/portainer.py volumes list --dangling
 15. **任务列表 150 条里 107 条是 shutdown 历史**，排障要过滤 `DesiredState != shutdown`（CLI 默认已过滤，`--all` 看全部）。
 16. **镜像 `RepoTags` 可能为空**（悬空），服务镜像常带 `@sha256:` 摘要，展示前要截断。
 17. **`volumes` 返回 `{Volumes:[...]}` 不是裸数组**（其他列表都是裸数组）。
-18. **多节点行为未验证**：本环境只有 1 个 manager。节点漂移、global 分布、多 manager 选举不要照搬本 skill 的结论。
+18. **创建栈必须带 `SwarmID`**（两版都要求），漏传 → `400 Invalid Swarm ID`。CLI 自动从 `/docker/swarm` 取。
+19. **【高风险】PUT 返回 200 不代表栈文件真改了**：2.45.1 实测出现过「200 但回读是旧内容」，而 `scale` 以栈文件为准，会把镜像悄悄改回去。CLI 写完一律回读校验。
+20. **跨节点取不到容器日志**：`containers/{id}/logs` 只能访问 agent 所在节点，跨节点 404 `No such container`；容器列表也只列本机容器。要 SSH 到目标节点 `docker logs`。
+21. **整栈 `stop` 会移除服务定义；`start` 对 active 栈 409、对已停栈可能超时且只重建为 `0/0`**。日常停单服务用 `services scale -r 0`。
+22. **镜像拉不到时任务是 `rejected` 不是 `failed`**，且会在节点间反复重试；排障要按 `rejected` 一起看。
+23. **多节点上 `node2` 的 `Status.Addr` 可能是 `0.0.0.0`**，按地址识别节点会失效，用 Hostname。
 
 ## 7. 端点速查
 
