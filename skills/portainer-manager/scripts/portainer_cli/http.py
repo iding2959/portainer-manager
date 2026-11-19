@@ -177,6 +177,7 @@ def request(
     data: Any = None,
     follow_redirects: bool = True,
     raw_body: Optional[str] = None,
+    timeout_override: Optional[float] = None,
 ) -> Response:
     """发一次请求并把非 2xx 也当响应返回，是否算错误由调用方决定。"""
     body = raw_body.encode("utf-8") if raw_body is not None else (
@@ -191,7 +192,9 @@ def request(
 
     method_name = method.upper()
     try:
-        with _opener(cfg.insecure, follow_redirects).open(request_obj, timeout=cfg.timeout) as raw:
+        with _opener(cfg.insecure, follow_redirects).open(
+            request_obj, timeout=timeout_override or cfg.timeout
+        ) as raw:
             status = getattr(raw, "status", None) or getattr(raw, "code", 0)
             headers = dict(raw.headers.items())
             payload = raw.read()

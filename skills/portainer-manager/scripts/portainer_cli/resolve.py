@@ -78,14 +78,61 @@ def names_hint(services: Sequence[Dict[str, Any]], limit: int = MAX_NAME_LIST) -
     return "、".join(names) if names else "（无）"
 
 
+def similar_services(services: Sequence[Dict[str, Any]], wanted: str, limit: int = 5) -> List[str]:
+    """找出「用户可能想输入的那几个」服务，用于报错时的引导。
+
+    简称规则是「服务全名 == 栈名_简称」，所以当栈名或服务名本身含连字符时，直觉上的简称
+    会和这条规则对不上（例如栈 `cloudflared` 下的服务 `cloudflared_cloudflare-tunnel`，
+    简称既不是 `cloudflared` 也不是 `cloudflare-tunnel`）。此时只列全量名字帮助有限，
+    要直接把「栈:服务」这种确定能用的写法摆出来。
+
+    判据：服务全名包含用户输入、或某个栈名包含用户输入，就算相近。
+    """
+    needle = (wanted or "").strip().lower()
+    if not needle:
+        return []
+    scored: List[tuple[int, str]] = []
+    for service in services:
+        full = service_name(service)
+        namespace = stack_of(service)
+        full_l, ns_l = full.lower(), (namespace or "").lower()
+        if needle in full_l:
+            # 命中「服务全名」比命中「仅栈名」更贴近用户意图，排在前面
+            scored.append((0, _address(service, full, namespace)))
+        elif namespace != "-" and (needle in ns_l or ns_l in needle):
+            scored.append((1, _address(service, full, namespace)))
+    scored.sort(key=lambda item: item[0])
+    seen: List[str] = []
+    for _, text in scored:
+        if text not in seen:
+            seen.append(text)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
+def _address(service: Dict[str, Any], full: str, namespace: str) -> str:
+    """给出一条可以直接粘贴的写法：`栈:服务简称`（比全名短，且一定能解析）。"""
+    if namespace and namespace != "-" and full.startswith(namespace + "_"):
+        return f"{namespace}:{full[len(namespace) + 1:]}"
+    return full
+
+
 def resolve_service(cfg: Config, wanted: str) -> Dict[str, Any]:
     services = all_services(cfg)
     found = match_service(services, wanted)
     if found is not None:
         return found
-    raise ApiError(
-        f"找不到服务 '{wanted}'（可用：{names_hint(services)}）"
-    )
+
+    hints = similar_services(services, wanted)
+    if hints:
+        # 有相近候选时，直接把能用的写法给出，省掉用户再猜一轮
+        raise ApiError(
+            f"找不到服务 '{wanted}'。相近的有：{'、'.join(hints)}\n"
+            f"提示：栈名或服务名含连字符时，简称规则（服务全名 = 栈名_简称）可能和直觉对不上，"
+            f"用 `栈:服务` 写法最稳。"
+        )
+    raise ApiError(f"找不到服务 '{wanted}'（可用：{names_hint(services)}）")
 
 
 def resolve_stack(cfg: Config, wanted: str) -> Dict[str, Any]:

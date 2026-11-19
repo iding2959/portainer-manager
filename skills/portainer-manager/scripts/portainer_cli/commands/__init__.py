@@ -4,6 +4,7 @@
 """
 
 __all__ = [
+    "configs",
     "containers",
     "health",
     "images",

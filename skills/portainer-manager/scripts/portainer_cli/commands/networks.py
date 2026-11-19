@@ -2,9 +2,9 @@
 
 from typing import Any, Dict, List
 
-from .. import EXIT_OK, add_sub
+from .. import ApiError, EXIT_OK, UsageError, add_sub
 from ..config import Config
-from ..http import as_list, docker_get
+from ..http import as_list, docker_get, docker_path, request, require_ok
 from ..output import dump_json, print_table, short_id
 
 
@@ -78,8 +78,93 @@ def get_network(cfg: Config, args: Any) -> int:
     return EXIT_OK
 
 
+def create_network(cfg: Config, args: Any) -> int:
+    """创建网络。overlay + attachable 是 Swarm 上最常用的组合（普通 docker run 也能接入）。"""
+    body: Dict[str, Any] = {"Name": args.name, "Driver": args.driver}
+    if args.overlay:
+        body["Driver"] = "overlay"
+        body["Attachable"] = True    # 不加 attachable 的话非 swarm 容器接不进来
+        body["Scope"] = "swarm"
+    if args.internal:
+        body["Internal"] = True
+    if args.subnet or args.gateway:
+        ipam_config: Dict[str, Any] = {}
+        if args.subnet:
+            ipam_config["Subnet"] = args.subnet
+        if args.gateway:
+            ipam_config["Gateway"] = args.gateway
+        body["IPAM"] = {"Driver": "default", "Config": [ipam_config]}
+    if args.label:
+        labels: Dict[str, str] = {}
+        for item in args.label:
+            if "=" not in item:
+                raise UsageError(f"--label 需要 K=V 形式，收到: {item}")
+            key, _, value = item.partition("=")
+            labels[key] = value
+        body["Labels"] = labels
+
+    path = docker_path(cfg, "networks/create")
+    if args.dry_run:
+        print(f"将 POST {path}")
+        dump_json(body)
+        return EXIT_OK
+
+    payload = require_ok(request(cfg, "POST", path, data=body)).json()
+    if args.json:
+        dump_json(payload)
+    else:
+        print(f"网络 '{args.name}' 已创建（{body.get('Driver')}，id={short_id(payload.get('Id'))}）")
+    return EXIT_OK
+
+
+def delete_network(cfg: Config, args: Any) -> int:
+    """删除网络。
+
+    Docker 自带保护：还有容器接入时会 `409 network ... has active endpoints`，
+    所以这里不自己拦（但 `--yes` 仍然是必需的，因为删错了要重建且 IP 会变）。
+    预置网络（bridge/host/none/ingress）删不掉，也不该删。
+    """
+    networks = as_list(docker_get(cfg, "networks"), f"/api/endpoints/{cfg.endpoint_id}/docker/networks")
+    matched = None
+    for item in networks:
+        if item.get("Name") == args.network or short_id(item.get("Id")) == args.network:
+            matched = item
+            break
+    if matched is None:
+        names = "、".join(i.get("Name") or "?" for i in networks)
+        raise UsageError(f"找不到网络 '{args.network}'（可用：{names}）")
+
+    name = matched.get("Name") or ""
+    if name in ("bridge", "host", "none", "ingress", "docker_gwbridge"):
+        raise UsageError(f"'{name}' 是 Docker/Swarm 预置网络，不能删除")
+
+    attached = matched.get("Containers") or {}
+    if attached and not args.force:
+        raise UsageError(
+            f"网络 '{name}' 上还接着 {len(attached)} 个容器，拒绝删除。\n"
+            f"（{'、'.join(list(attached.values())[0].get('Name', '?') for _ in [0])}…）"
+        )
+    if not args.yes:
+        raise UsageError(f"删除网络 '{name}' 须显式加 --yes")
+
+    try:
+        require_ok(request(cfg, "DELETE", docker_path(cfg, f"networks/{matched.get('Id')}")))
+    except ApiError as exc:
+        if "active endpoints" in str(exc):
+            raise UsageError(
+                f"网络 '{name}' 仍有端点接入，Docker 拒绝删除：{exc}\n先断开/删除接入的容器或服务。"
+            ) from exc
+        raise
+
+    if args.json:
+        dump_json({"deleted": name})
+    else:
+        print(f"网络 '{name}' 已删除")
+    return EXIT_OK
+
+
 def register(subparsers: Any, common: Any) -> None:
-    parser = add_sub(subparsers, "networks", "Docker 网络", common)
+    parser = add_sub(subparsers, "networks", "Docker 网络（增删查）", common)
     sub = parser.add_subparsers(dest="action", metavar="<动作>")
 
     lister = add_sub(sub, "list", "网络列表", common)
@@ -89,3 +174,20 @@ def register(subparsers: Any, common: Any) -> None:
     getter = add_sub(sub, "get", "网络详情（含接入容器）", common)
     getter.add_argument("network", help="网络名或短 id")
     getter.set_defaults(func=get_network)
+
+    creator = add_sub(sub, "create", "创建网络", common)
+    creator.add_argument("name", help="网络名")
+    creator.add_argument("--driver", default="bridge", metavar="D", help="驱动，默认 bridge")
+    creator.add_argument("--overlay", action="store_true", help="建 Swarm overlay 网络（自动 attachable）")
+    creator.add_argument("--subnet", metavar="CIDR", help="子网，如 10.0.9.0/24")
+    creator.add_argument("--gateway", metavar="IP", help="网关")
+    creator.add_argument("--internal", action="store_true", help="创建内部网络（无外网出口）")
+    creator.add_argument("--label", action="append", metavar="K=V", help="标签，可重复")
+    creator.add_argument("--dry-run", action="store_true", help="只打印将提交的请求体")
+    creator.set_defaults(func=create_network)
+
+    deleter = add_sub(sub, "delete", "删除网络（需 --yes）", common)
+    deleter.add_argument("network", help="网络名或短 id")
+    deleter.add_argument("--force", action="store_true", help="即使有容器接入也提交（Docker 仍会 409 拒绝）")
+    deleter.add_argument("--yes", action="store_true", help="确认删除")
+    deleter.set_defaults(func=delete_network)

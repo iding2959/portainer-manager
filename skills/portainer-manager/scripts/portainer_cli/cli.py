@@ -8,6 +8,7 @@ import argparse
 from typing import List, Sequence
 
 from .commands import (
+    configs,
     containers,
     health,
     images,
@@ -33,6 +34,7 @@ COMMAND_MODULES = (
     tasks,
     containers,
     networks,
+    configs,
     volumes,
     images,
     resources,

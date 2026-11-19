@@ -132,25 +132,35 @@ n8n  n8n   replicated  1/1        5678->5678  ghcr.io/deluxebear/n8n:2.36.9-chs 
 | `tasks list [--service S] [--state S] [--failed-only] [--all]` | 任务（默认隐藏 shutdown 历史） |
 | `containers list [--all] [--stack S] [--search S]` | 容器（含栈归属、健康状态） |
 | `networks list [--scope local\|swarm]` / `networks get <name>` | 网络（含接入容器与 IPv4） |
-| `volumes list [--dangling] [--search S]` | 卷（大小/引用/栈） |
+| `volumes list [--dangling] [--search S] [--stack S]` / `volumes get <name>` | 卷；`get` 会反查在用容器 |
 | `images list [--search S] [--dangling] [--limit N]` | 镜像（按体积降序，查磁盘占用） |
+| `configs list [--search S]` / `configs get <name>` | Swarm config；`get` 反查引用它的服务 |
+| `secrets list [--search S]` / `secrets get <name>` | Swarm secret（值不可读）；`get` 反查引用服务 |
 | `endpoints list` | Portainer 环境列表与快照 |
 | `settings show` | Portainer 公开设置 |
 | `users list` / `teams list` | 用户（Role 1=admin 2=user）/ 团队 |
 | `registries list` | 镜像仓库（**凭据已脱敏**） |
 
-### 3.2 写操作（全部需 `--yes`）
+### 3.2 写操作（增删改，全部需 `--yes`）
 
-| 命令 | HTTP | 说明 |
-|---|---|---|
-| `stacks update <stack> --file PATH \| --set-image SVC=IMG [--prune] [--repull]` | PUT /api/stacks/{id} | 改栈文件后重新部署整栈 |
-| `stacks create --name N --file PATH [--env K=V]` | POST /api/stacks/create/swarm/string | 从本地 compose 创建栈 |
-| `stacks start <stack>` / `stacks stop <stack>` | POST /api/stacks/{id}/{start,stop} | **整栈**启停（无 body） |
-| `stacks delete <stack>` | DELETE /api/stacks/{id} | 删除栈（连带服务与卷） |
-| `services scale <svc> -r N` | PUT /api/stacks/{id} | 改副本数 —— **实为改栈文件重新部署** |
-| `raw <METHOD> <PATH> [--data JSON\|@file]` | 任意 | 逃生口；写方法需 `--yes` |
+| 资源 | 创建 | 修改 | 删除 |
+|---|---|---|---|
+| **栈** | `stacks create --name N --file PATH` | `stacks update <s> --file PATH \| --set-image SVC=IMG [--prune] [--repull]` | `stacks delete <s>` |
+| **服务** | （随栈创建） | `services scale <svc> -r N`（走栈重部署） | （随栈删除） |
+| **卷** | `volumes create <name> [--driver] [--label K=V] [--opt K=V]` | （Docker 卷不可改，只能重建） | `volumes delete <name>` |
+| **网络** | `networks create <name> [--overlay] [--subnet CIDR] [--internal]` | （Docker 网络不可改） | `networks delete <name>` |
+| **镜像** | `images pull <ref>` | — | `images delete <ref>` / `images prune [--all]` |
+| **Config** | `configs create <name> --from-file PATH \| --from-stdin` | （Docker 不可改，需重建） | `configs delete <name>` |
+| **Secret** | `secrets create <name> --from-file PATH \| --from-stdin` | （Docker 不可改，需重建） | `secrets delete <name>` |
+| **仓库凭据** | `registries create --name --url [--username]` | — | `registries delete <registry>` |
+| **任意** | | | `raw <METHOD> <PATH>`（写方法需 --yes） |
 
-所有写操作都支持 `--dry-run`（`stacks delete`/`start`/`stop` 除外），零成本看将提交的请求体。
+补充：整栈启停 `stacks start|stop <stack>`；所有写操作支持 `--dry-run`
+（`stacks delete/start/stop` 除外），零成本看将提交的请求体。
+
+**为什么口令/password 一律不给命令行参数**：`images`/`configs`/`secrets`/`registries` 的
+敏感内容只从 `--from-file`、`--from-stdin` 或环境变量读。命令行参数会留在 shell history
+和 `ps` 输出里，等于泄漏。
 
 ### 3.3 服务名解析（三级匹配）
 
@@ -274,20 +284,34 @@ networks:
     external: true
 ```
 
-### 5.7 磁盘占用排查
+### 5.7 磁盘占用排查与清理
 
 ```bash
-# 最大的镜像
+# 1) 看占用（宿主侧最准，Portainer 的 volumes 常缺 UsageData）
+docker system df
+
+# 2) Portainer 侧：最大的镜像 / 悬空镜像 / 未引用卷
 python3 scripts/portainer.py images list --limit 20
-
-# 悬空镜像（无标签，通常是构建/更新残留）
 python3 scripts/portainer.py images list --dangling
-
-# 未被引用的卷
 python3 scripts/portainer.py volumes list --dangling
+
+# 3) 预览会删什么（dry-run 不需要 --yes）
+python3 scripts/portainer.py images prune --all --dry-run
+python3 scripts/portainer.py volumes list --dangling
+
+# 4) 执行清理
+python3 scripts/portainer.py images prune --all --yes    # 无容器引用的镜像
+python3 scripts/portainer.py --json volumes list --dangling \
+  | jq -r '.[].Name' | while read -r v; do
+      python3 scripts/portainer.py volumes delete "$v" --yes
+    done
 ```
 
-本环境的卷普遍没有 `UsageData`，所以大小/引用列显示 `-`——要真实占用得 SSH 上机 `du`。
+`images prune` 默认只清**悬空**（无 tag）镜像；`--all` 才会连「有 tag 但无容器引用」的
+备用镜像一起清——后者往往是你留着重滚的版本，所以要显式给 `--all`。
+
+本环境的卷普遍没有 `UsageData`，所以大小/引用列显示 `-`，**不代表卷是空的**；
+`volumes get <name>` 会反查真实在用容器，比 Docker 给的计数可靠。
 
 ## 6. 关键坑（完整清单见 `references/pitfalls.md`）
 

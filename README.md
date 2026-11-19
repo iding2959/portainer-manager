@@ -132,8 +132,12 @@ python3 skills/portainer-manager/scripts/portainer.py raw GET /api/stacks/name/n
 | `tasks list` | 任务（默认隐藏 shutdown 历史，`--all` 看全部） |
 | `containers list` | 容器（含栈归属、健康状态） |
 | `networks list/get` | 网络（含接入容器与 IPv4） |
-| `volumes list` | 卷（`--dangling` 查未引用） |
-| `images list` | 镜像（按体积降序，查磁盘占用） |
+| `volumes list/get/create/delete` | 卷；`get` 反查在用容器，`delete` 需 `--yes` |
+| `images list/delete/prune/pull` | 镜像；`prune --all` 清无引用镜像（先 `--dry-run`） |
+| `networks list/get/create/delete` | 网络；预置网络（bridge/host/ingress）受保护 |
+| `configs list/get/create/delete` | Swarm config；`get` 反查引用它的服务 |
+| `secrets list/get/create/delete` | Swarm secret（值不可读）；口令只从文件/stdin 读 |
+| `registries list/create/delete` | 仓库凭据；口令只从文件/环境变量读 |
 | `endpoints list` / `settings show` | Portainer 环境 / 公开设置 |
 | `users list` / `teams list` / `registries list` | 用户 / 团队 / 仓库（凭据脱敏） |
 | `raw <METHOD> <PATH>` | 任意端点逃生口（写方法需 `--yes`） |
