@@ -94,23 +94,34 @@ Wrong credentials return **422**, not 401.
 | `tasks list [--service S] [--state S] [--failed-only] [--all]` | Tasks; shutdown history hidden by default |
 | `containers list [--all] [--stack S] [--search S]` | Containers with stack ownership and health |
 | `networks list [--scope local\|swarm]` / `networks get <name>` | Networks, incl. attached containers |
-| `volumes list [--dangling] [--search S]` | Volumes |
+| `volumes list [--dangling] [--search S] [--stack S]` / `volumes get <name>` | Volumes; `get` reverse-looks-up containers using it |
 | `images list [--search S] [--dangling] [--limit N]` | Images sorted by size desc |
+| `configs list [--search S]` / `configs get <name>` | Swarm configs; `get` lists services referencing it |
+| `secrets list [--search S]` / `secrets get <name>` | Swarm secrets (value unreadable); `get` lists referencing services |
 | `endpoints list` / `settings show` | Portainer environments / public settings |
 | `users list` / `teams list` / `registries list` | Users (Role 1=admin 2=user) / teams / registries (**credentials redacted**) |
 
-### 3.2 Write operations (all require `--yes`)
+### 3.2 Write operations — create / update / delete (all require `--yes`)
 
-| Command | HTTP | Notes |
-|---|---|---|
-| `stacks update <stack> --file PATH \| --set-image SVC=IMG [--prune] [--repull]` | PUT /api/stacks/{id} | Edit compose, redeploy the whole stack |
-| `stacks create --name N --file PATH [--env K=V]` | POST /api/stacks/create/swarm/string | Create a stack from a local compose file |
-| `stacks start <stack>` / `stacks stop <stack>` | POST /api/stacks/{id}/{start,stop} | Start/stop the **whole stack** (no body) |
-| `stacks delete <stack>` | DELETE /api/stacks/{id} | Deletes stack with its services and volumes |
-| `services scale <svc> -r N` | PUT /api/stacks/{id} | Replica count — **implemented as a stack redeploy** |
-| `raw <METHOD> <PATH> [--data JSON\|@file]` | any | Escape hatch; write methods need `--yes` |
+| Resource | Create | Update | Delete |
+|---|---|---|---|
+| **Stacks** | `stacks create --name N --file PATH` | `stacks update <s> --file PATH \| --set-image SVC=IMG [--prune] [--repull]` | `stacks delete <s>` |
+| **Services** | (via stack) | `services scale <svc> -r N` (redeploys the stack) | (via stack) |
+| **Volumes** | `volumes create <name> [--driver] [--label K=V] [--opt K=V]` | (immutable in Docker — recreate) | `volumes delete <name>` |
+| **Networks** | `networks create <name> [--overlay] [--subnet CIDR] [--internal]` | (immutable in Docker) | `networks delete <name>` |
+| **Images** | `images pull <ref>` | — | `images delete <ref>` / `images prune [--all]` |
+| **Configs** | `configs create <name> --from-file PATH \| --from-stdin` | (immutable in Docker — recreate) | `configs delete <name>` |
+| **Secrets** | `secrets create <name> --from-file PATH \| --from-stdin` | (immutable in Docker — recreate) | `secrets delete <name>` |
+| **Registries** | `registries create --name --url [--registry-username]` | — | `registries delete <registry>` |
+| **Anything** | | | `raw <METHOD> <PATH>` (write methods need `--yes`) |
 
-Every write command supports `--dry-run` (except `stacks delete/start/stop`).
+Also: `stacks start|stop <stack>` starts/stops a whole stack. Every write command supports
+`--dry-run` (except `stacks delete/start/stop`), so you can inspect the request body for free.
+
+**Why secrets and passwords never appear as command-line arguments**: `images`/`configs`/
+`secrets`/`registries` accept sensitive content only via `--from-file`, `--from-stdin`, or an
+environment variable. Command-line arguments persist in shell history and in `ps` output, which
+amounts to leaking them.
 
 ### 3.3 Service name resolution
 
@@ -124,6 +135,12 @@ python3 scripts/portainer.py services get n8n:n8n   # stack:service (to disambig
 
 Ambiguous short names produce an error listing the full names. Stack-less services (e.g. `sandbox-api`)
 only resolve by full name.
+
+When a short name does not match, the error suggests the workable `stack:service` form rather than
+dumping every service name — because the rule is literally "full name equals `stack` + `_` + short name",
+and that is not obvious when the stack name or the service name itself contains a hyphen. For example
+the service `cloudflared_cloudflare-tunnel` in stack `cloudflared` is reachable as
+`cloudflared:cloudflare-tunnel`, not as `cloudflared`.
 
 ## 4. Hard limit: change services through stacks
 
@@ -232,16 +249,75 @@ networks:
     external: true
 ```
 
-### 5.7 Disk usage
+### 5.7 Disk usage: inspect and reclaim
 
 ```bash
-python3 scripts/portainer.py images list --limit 20     # largest images
-python3 scripts/portainer.py images list --dangling     # tagless leftovers
-python3 scripts/portainer.py volumes list --dangling    # unreferenced volumes
+# 1) Ground truth is on the host — Portainer's volume objects usually lack UsageData
+docker system df
+
+# 2) Portainer side: largest images / tagless leftovers / unreferenced volumes
+python3 scripts/portainer.py images list --limit 20
+python3 scripts/portainer.py images list --dangling
+python3 scripts/portainer.py volumes list --dangling
+
+# 3) Preview what would be removed (dry-run does not need --yes)
+python3 scripts/portainer.py images prune --all --dry-run
+
+# 4) Execute
+python3 scripts/portainer.py images prune --all --yes     # images no container references
+python3 scripts/portainer.py --json volumes list --dangling \
+  | jq -r '.[].Name' | while read -r v; do
+      python3 scripts/portainer.py volumes delete "$v" --yes
+    done
 ```
 
-Volumes in this environment generally lack `UsageData`, so size/reference columns show `-`;
-measure real usage over SSH with `du`.
+`images prune` by default removes only **dangling** (tagless) images; `--all` also removes tagged
+images that no container references. Those tagged ones are often the rollback versions you kept
+on purpose, which is why `--all` has to be explicit.
+
+Volumes in this environment generally lack `UsageData`, so the size/reference columns show `-` —
+that does **not** mean the volume is empty. `volumes get <name>` reverse-looks-up the containers
+actually using it, which is more reliable than Docker's own ref count.
+
+### 5.8 Managing volumes, networks, configs, secrets and registries
+
+```bash
+# --- Volumes: create, inspect (reverse-lookup containers), delete ---
+python3 scripts/portainer.py volumes create appdata --label env=prod
+python3 scripts/portainer.py volumes get appdata      # shows which containers mount it
+python3 scripts/portainer.py volumes delete appdata --yes
+
+# --- Networks: overlay networks need --overlay (adds Attachable automatically) ---
+python3 scripts/portainer.py networks create app-net --overlay --subnet 10.0.20.0/24
+python3 scripts/portainer.py networks get app-net
+python3 scripts/portainer.py networks delete app-net --yes
+
+# --- Images ---
+python3 scripts/portainer.py images pull nginx:1.27-alpine
+python3 scripts/portainer.py images delete nginx:1.27-alpine --yes
+python3 scripts/portainer.py images prune --all --dry-run   # preview, no --yes needed
+python3 scripts/portainer.py images prune --all --yes
+
+# --- Configs / Secrets: content comes from a file or stdin, never the command line ---
+python3 scripts/portainer.py configs create nginx-conf --from-file ./nginx.conf --stack myapp
+python3 scripts/portainer.py configs get nginx-conf    # lists services referencing it
+python3 scripts/portainer.py configs delete nginx-conf --yes
+
+printf '%s' "$STRONG_PASSWORD" | python3 scripts/portainer.py secrets create db-pass --from-stdin
+python3 scripts/portainer.py secrets get db-pass
+python3 scripts/portainer.py secrets delete db-pass --yes
+
+# --- Registry credentials (password via file or $PORTAINER_REGISTRY_PASSWORD) ---
+python3 scripts/portainer.py registries create \
+  --name harbor --url registry.example.com:5000 --registry-username admin \
+  --password-file /run/secrets/harbor-pass
+python3 scripts/portainer.py registries delete harbor --yes
+```
+
+Two notes that save an iteration. First, **config and secret objects are immutable** — there is no
+update; change the content by creating a new object and updating the services that reference it.
+Second, deleting an object that a service still references fails with `409`, so run the `get`
+variant first: it tells you exactly which services to update.
 
 ## 6. Key pitfalls (full list in `references/pitfalls.md`)
 
@@ -305,6 +381,20 @@ python3 scripts/portainer.py --json raw GET '/api/endpoints/1/docker/tasks' | jq
 - **Always `--dry-run` first.**
 - **Credentials belong in environment variables or `~/.portainer/config.json` (600).**
 - **`services get` prints env vars verbatim** (including secrets such as database passwords); redact before sharing.
+- **New credentials never go on the command line.** `configs create` / `secrets create` /
+  `registries create` accept content only via `--from-file`, `--from-stdin`, or an environment
+  variable — arguments show up in shell history and `ps`.
+- **Deletes reverse-look-up references before acting.** `volumes get` lists containers using the
+  volume, `configs get` / `secrets get` list services referencing the object, `images delete` lists
+  containers using the image. Read that list before confirming; Docker's own `409 in use` is the
+  last line of defence, not the first warning.
+- **`volumes delete` / `networks delete` / `images delete` are irreversible.** Volume deletion
+  destroys data that a stopped container once wrote. `--force` bypasses the CLI's reference check,
+  not Docker's.
+- **Preset networks are protected**: `bridge` / `host` / `none` / `ingress` / `docker_gwbridge`
+  cannot be deleted and the CLI refuses them outright.
+- **`images prune` without `--all` only removes dangling images.** `--all` also removes tagged but
+  unreferenced images — usually your rollback versions.
 
 ### 8.1 Untrusted content
 

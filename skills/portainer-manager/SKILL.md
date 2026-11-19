@@ -313,6 +313,45 @@ python3 scripts/portainer.py --json volumes list --dangling \
 本环境的卷普遍没有 `UsageData`，所以大小/引用列显示 `-`，**不代表卷是空的**；
 `volumes get <name>` 会反查真实在用容器，比 Docker 给的计数可靠。
 
+### 5.8 卷 / 网络 / Config / Secret / 仓库凭据的日常操作
+
+```bash
+# --- 卷：建、查（反查在用容器）、删 ---
+python3 scripts/portainer.py volumes create appdata --label env=prod
+python3 scripts/portainer.py volumes get appdata       # 会列出哪些容器在挂它
+python3 scripts/portainer.py volumes delete appdata --yes
+
+# --- 网络：overlay 要加 --overlay（会自动带 Attachable）---
+python3 scripts/portainer.py networks create app-net --overlay --subnet 10.0.20.0/24
+python3 scripts/portainer.py networks get app-net
+python3 scripts/portainer.py networks delete app-net --yes
+
+# --- 镜像 ---
+python3 scripts/portainer.py images pull nginx:1.27-alpine
+python3 scripts/portainer.py images delete nginx:1.27-alpine --yes
+python3 scripts/portainer.py images prune --all --dry-run   # 预览不需要 --yes
+python3 scripts/portainer.py images prune --all --yes
+
+# --- Config / Secret：内容从文件或 stdin 来，绝不走命令行 ---
+python3 scripts/portainer.py configs create nginx-conf --from-file ./nginx.conf --stack myapp
+python3 scripts/portainer.py configs get nginx-conf    # 列出引用它的服务
+python3 scripts/portainer.py configs delete nginx-conf --yes
+
+printf '%s' "$STRONG_PASSWORD" | python3 scripts/portainer.py secrets create db-pass --from-stdin
+python3 scripts/portainer.py secrets get db-pass
+python3 scripts/portainer.py secrets delete db-pass --yes
+
+# --- 仓库凭据（口令从文件或 $PORTAINER_REGISTRY_PASSWORD 来）---
+python3 scripts/portainer.py registries create \
+  --name harbor --url registry.example.com:5000 --registry-username admin \
+  --password-file /run/secrets/harbor-pass
+python3 scripts/portainer.py registries delete harbor --yes
+```
+
+两个能省一轮试错的点：**config 与 secret 都是不可变对象**，没有 update——改内容只能建新对象
+再更新引用它的服务；另外删除仍被服务引用的对象会 `409`，所以先跑 `get` 变体，它会告诉你
+具体要更新哪些服务。
+
 ## 6. 关键坑（完整清单见 `references/pitfalls.md`）
 
 1. **【纪律】不要拿真实资源 id 做「方法探测」。** 对真实服务 id 发 `DELETE` 会真删服务（本 skill 编写时就因此误删过一个生产服务）。只读探测只用 `GET`；写操作先有明确意图并取得人类确认。「返回 404 所以安全」是错的——404 只说明该 id 不存在。
